@@ -22,6 +22,7 @@ limitations under the License.
 #include <atomic>
 #include <cassert>
 #include <mutex>
+#include <iostream>
 
 #include <string.h>
 
@@ -33,6 +34,8 @@ class calc_state_machine : public state_machine {
 public:
     calc_state_machine()
         : cur_value_(0)
+        , player1_pos(0)
+        , player2_pos(99)
         , last_committed_idx_(0)
         {}
 
@@ -51,23 +54,28 @@ public:
         int oprnd_;
     };
 
-    static ptr<buffer> enc_log(const op_payload& payload) {
+    struct game_op_payload {
+        int player_number;
+        int pos_next;
+    };
+
+    static ptr<buffer> enc_log(const game_op_payload& payload) {
         // Encode from {operator, operand} to Raft log.
-        ptr<buffer> ret = buffer::alloc(sizeof(op_payload));
+        ptr<buffer> ret = buffer::alloc(sizeof(game_op_payload));
         buffer_serializer bs(ret);
 
         // WARNING: We don't consider endian-safety in this example.
-        bs.put_raw(&payload, sizeof(op_payload));
+        bs.put_raw(&payload, sizeof(game_op_payload));
 
         return ret;
     }
 
-    static void dec_log(buffer& log, op_payload& payload_out) {
+    static void dec_log(buffer& log, game_op_payload& payload_out) {
         // Decode from Raft log to {operator, operand} pair.
-        assert(log.size() == sizeof(op_payload));
+        assert(log.size() == sizeof(game_op_payload));
 
         buffer_serializer bs(log);
-        memcpy(&payload_out, bs.get_raw(log.size()), sizeof(op_payload));
+        memcpy(&payload_out, bs.get_raw(log.size()), sizeof(game_op_payload));
     }
 
     ptr<buffer> pre_commit(const ulong log_idx, buffer& data) {
@@ -76,19 +84,29 @@ public:
     }
 
     ptr<buffer> commit(const ulong log_idx, buffer& data) {
-        op_payload payload;
+        game_op_payload payload;
         dec_log(data, payload);
 
-        int64_t prev_value = cur_value_;
-        switch (payload.type_) {
-        case ADD:   prev_value += payload.oprnd_;   break;
-        case SUB:   prev_value -= payload.oprnd_;   break;
-        case MUL:   prev_value *= payload.oprnd_;   break;
-        case DIV:   prev_value /= payload.oprnd_;   break;
-        default:
-        case SET:   prev_value  = payload.oprnd_;   break;
+        std::cout << "commit got player " << payload.player_number << " pos " << payload.pos_next << std::endl;
+
+        // int64_t prev_value = cur_value_;
+        // switch (payload.type_) {
+        // case ADD:   prev_value += payload.oprnd_;   break;
+        // case SUB:   prev_value -= payload.oprnd_;   break;
+        // case MUL:   prev_value *= payload.oprnd_;   break;
+        // case DIV:   prev_value /= payload.oprnd_;   break;
+        // default:
+        // case SET:   prev_value  = payload.oprnd_;   break;
+        // }
+        // cur_value_ = prev_value;
+
+        if (payload.player_number == 1) {
+            player1_pos = payload.pos_next;
+        } else {
+            player2_pos = payload.pos_next;
         }
-        cur_value_ = prev_value;
+
+        std::cout << "player" << payload.player_number << " moved to" << payload.pos_next << std::endl;
 
         last_committed_idx_ = log_idx;
 
@@ -204,6 +222,13 @@ public:
     }
 
     int64_t get_current_value() const { return cur_value_; }
+    int64_t get_player_pos(int player_num) const { 
+        if (player_num == 1) {
+            return player1_pos;
+        } else {
+            return player2_pos;
+        }
+    }
 
 private:
     struct snapshot_ctx {
@@ -231,6 +256,9 @@ private:
             entry = snapshots_.erase(entry);
         }
     }
+
+    //Player positions
+    std::atomic<int64_t> player1_pos, player2_pos;
 
     // State machine's current value.
     std::atomic<int64_t> cur_value_;

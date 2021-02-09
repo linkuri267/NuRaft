@@ -60,34 +60,43 @@ void handle_result(ptr<TestSuite::Timer> timer,
     std::cout << "succeeded, "
               << TestSuite::usToString( timer->getTimeUs() )
               << ", return value: "
-              << ret_value
-              << ", state machine value: "
-              << get_sm()->get_current_value()
+              << ret_value << std::endl
+              << "state machine value: "
+              << get_sm()->get_current_value() << std::endl
+              << "player1 pos: "
+              << get_sm()->get_player_pos(1) << std::endl
+              << ", player2 pos: " 
+              << get_sm()->get_player_pos(2)
               << std::endl;
 }
 
 void append_log(const std::string& cmd,
                 const std::vector<std::string>& tokens)
 {
-    char cmd_char = cmd[0];
-    int operand = atoi( tokens[0].substr(1).c_str() );
-    calc_state_machine::op_type op = calc_state_machine::ADD;
-    switch (cmd_char) {
-    case '+':   op = calc_state_machine::ADD;   break;
-    case '-':   op = calc_state_machine::SUB;   break;
-    case '*':   op = calc_state_machine::MUL;   break;
-    case '/':
-        op = calc_state_machine::DIV;
-        if (!operand) {
-            std::cout << "cannot divide by zero" << std::endl;
-            return;
-        }
-        break;
-    default:    op = calc_state_machine::SET;   break;
-    };
+    // char cmd_char = cmd[0];
+    // int operand = atoi( tokens[0].substr(1).c_str() );
+    // calc_state_machine::op_type op = calc_state_machine::ADD;
+    // switch (cmd_char) {
+    // case '+':   op = calc_state_machine::ADD;   break;
+    // case '-':   op = calc_state_machine::SUB;   break;
+    // case '*':   op = calc_state_machine::MUL;   break;
+    // case '/':
+    //     op = calc_state_machine::DIV;
+    //     if (!operand) {
+    //         std::cout << "cannot divide by zero" << std::endl;
+    //         return;
+    //     }
+    //     break;
+    // default:    op = calc_state_machine::SET;   break;
+    // };
+
+    int player = atoi( tokens[1].c_str() );
+    int pos = atoi( tokens[2].c_str() );
+
+    std::cout << "player " << player << " attempting to move to pos " << pos << std::endl;
 
     // Serialize and generate Raft log to append.
-    ptr<buffer> new_log = calc_state_machine::enc_log( {op, operand} );
+    ptr<buffer> new_log = calc_state_machine::enc_log( {player, pos} );
 
     // To measure the elapsed time.
     ptr<TestSuite::Timer> timer = cs_new<TestSuite::Timer>();
@@ -141,7 +150,11 @@ void print_status(const std::string& cmd,
         << "last committed index: "
             << stuff.raft_instance_->get_committed_log_idx() << std::endl
         << "state machine value: "
-            << get_sm()->get_current_value() << std::endl;
+            << get_sm()->get_current_value() << std::endl
+        << "player1 pos: "
+            << get_sm()->get_player_pos(1) << std::endl
+        << "player2 pos: " 
+            << get_sm()->get_player_pos(2) << std::endl;
 }
 
 void help(const std::string& cmd,
@@ -173,13 +186,15 @@ bool do_cmd(const std::vector<std::string>& tokens) {
         stuff.launcher_.shutdown(5);
         stuff.reset();
         return false;
-
-    } else if ( cmd[0] == '+' ||
-                cmd[0] == '-' ||
-                cmd[0] == '*' ||
-                cmd[0] == '/' ) {
-        // e.g.) +1
+    } else if ( cmd == "move" ) {
         append_log(cmd, tokens);
+
+    // } else if ( cmd[0] == '+' ||
+    //             cmd[0] == '-' ||
+    //             cmd[0] == '*' ||
+    //             cmd[0] == '/' ) {
+    //     // e.g.) +1
+    //     append_log(cmd, tokens);
 
     } else if ( cmd == "add" ) {
         // e.g.) add 2 localhost:12345
