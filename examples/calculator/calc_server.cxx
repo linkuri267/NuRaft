@@ -27,6 +27,16 @@ limitations under the License.
 #include <sstream>
 
 #include <stdio.h>
+#include <unistd.h>
+#include <sys/socket.h>
+#include <stdlib.h>
+#include <netinet/in.h>
+#include <arpa/inet.h>
+#include <string.h>
+#include <thread>
+#include <vector>
+#include <strstream>
+#define PORT 8080
 
 using namespace nuraft;
 
@@ -177,6 +187,97 @@ void help(const std::string& cmd,
     << "\n";
 }
 
+std::vector<std::string> split(const std::string& str, const std::string& delim){
+    std::vector<std::string> res;
+    if("" == str) return res;
+    char * strs = new char[str.length() + 1];
+    strcpy(strs, str.c_str());
+
+    char * d = new char[delim.length() + 1];
+    strcpy(d, delim.c_str());
+
+    char *p = strtok(strs, d);
+    while(p){
+        std::string s = p;
+        res.push_back(s);
+        p = strtok(NULL, d);
+    }
+
+    return res;
+}
+
+int converStringToInt(const std::string &s){
+    int val;
+    std::strstream ss;
+    ss << s;
+    ss >> val;
+    return val;
+}
+
+std::string pack(std::vector<std::string> tokens){
+    std::string res = "";
+    for(std::string v: tokens){
+        res += v;
+        res += "-";
+    }
+    return res;
+}
+
+std::vector<std::string> unpack(char msg[]){
+    std::vector<std::string> tokens;
+    char *token = strtok(msg, "-");
+    while(token != NULL){
+        //std::cout<<"token: "<<token<<std::endl;
+        tokens.push_back(token);
+        token = strtok(NULL, "-");
+    }
+    return tokens;
+}
+
+std::string get_server_addr(int server_id){
+    std::vector<ptr<srv_config>> configs;
+    stuff.raft_instance_->get_srv_config_all(configs);
+
+    int leader_id = stuff.raft_instance_->get_leader();
+    if(server_id == leader_id) return "-1";
+    for(auto& entry: configs){
+        ptr<srv_config>& srv = entry;
+
+        if(srv->get_id() == leader_id){
+            return srv->get_endpoint();
+        }
+    }
+    return "-2";
+}
+
+int sock_connect(std::string srv_ip, std::string srv_port){
+    int sock = 0;
+    struct sockaddr_in serv_addr;
+    char buffer[1024];
+
+    if((sock = socket(AF_INET, SOCK_STREAM, 0)) < 0){
+        printf("\n Socket creation error \n");
+        return -1;
+    }
+    serv_addr.sin_family = AF_INET;
+    serv_addr.sin_port = htons(8080);//htons(converStringToInt(srv_port));
+
+    if(srv_ip == "localhost") srv_ip = "127.0.0.1";
+
+    // convert IPv4 and IPv6 addresses from text to binary form
+    if(inet_pton(AF_INET, &*srv_ip.begin(), &serv_addr.sin_addr) <= 0){
+        printf("\nInvalid address/ Address not suported \n");
+        return -1;
+    }
+
+    if(connect(sock, (struct sockaddr *)&serv_addr, sizeof(serv_addr)) < 0){
+        printf("\nConnection Failed \n");
+        return -1;
+    }
+
+    return sock;
+}
+
 bool do_cmd(const std::vector<std::string>& tokens) {
     if (!tokens.size()) return true;
 
@@ -187,15 +288,44 @@ bool do_cmd(const std::vector<std::string>& tokens) {
         stuff.reset();
         return false;
     } else if ( cmd == "move" ) {
-        append_log(cmd, tokens);
+        std::string srv_addr_str = get_server_addr(stuff.server_id_);
+        if(srv_addr_str == "-2"){
+            //std::cout<<"-2"<<std::endl;
+            perror("getting server addr failed");
+            return false;
+        }else if(srv_addr_str == "-1"){
+            //std::cout<<"-1"<<std::endl;
+            append_log(cmd, tokens);
+        }else{
+            //std::cout<<">0"<<std::endl;
+            int delim_pos = srv_addr_str.find(":");
+            std::string srv_ip = srv_addr_str.substr(0, delim_pos);
+            std::string srv_port = srv_addr_str.substr(delim_pos+1, srv_addr_str.length());
+            int sock = sock_connect(srv_ip, srv_port);
 
-    // } else if ( cmd[0] == '+' ||
-    //             cmd[0] == '-' ||
-    //             cmd[0] == '*' ||
-    //             cmd[0] == '/' ) {
-    //     // e.g.) +1
-    //     append_log(cmd, tokens);
-
+            std::string res = pack(tokens);
+            int n = send(sock, res.c_str(), res.length(), 0);
+            if(n < 0){
+                std::cout<<"ERROR writing to socket"<<std::endl;
+            }else{
+                //std::cout<<"tokens message sent"<<std::endl;
+            }
+            
+            char buffer[1024];
+            n = read(sock, buffer, 1024);
+            if(n < 0){
+                std::cout<<"ERROR reading from socket"<<std::endl;
+            }else{
+                std::cout<<"client receives:"<<buffer<<std::endl;
+            }
+            close(sock);
+            // } else if ( cmd[0] == '+' ||
+            //             cmd[0] == '-' ||
+            //             cmd[0] == '*' ||
+            //             cmd[0] == '/' ) {
+            //     // e.g.) +1
+            //     append_log(cmd, tokens);
+        }
     } else if ( cmd == "add" ) {
         // e.g.) add 2 localhost:12345
         add_server(cmd, tokens);
@@ -215,6 +345,61 @@ bool do_cmd(const std::vector<std::string>& tokens) {
 }; // namespace calc_server;
 using namespace calc_server;
 
+void server_listening(){
+    int server_fd, new_socket, valread;
+    struct sockaddr_in address;
+    int opt = 1;
+    int addrlen = sizeof(address);
+    char buffer[1024];
+
+    // create socket file descriptor
+    if((server_fd = socket(AF_INET, SOCK_STREAM, 0)) == 0){
+        perror("socket failed");
+        exit(1);
+    }
+
+    // forcefully attaching socket to the port 8080
+    if(setsockopt(server_fd, SOL_SOCKET, SO_REUSEADDR | SO_REUSEPORT, &opt, sizeof(opt))){
+        perror("setsockopt");
+        exit(1);
+    }
+    address.sin_family = AF_INET;
+    address.sin_addr.s_addr = htonl(INADDR_ANY);
+    address.sin_port = htons(PORT);
+
+    if(bind(server_fd, (struct sockaddr *)&address, sizeof(address)) < 0){
+        perror("bind failed");
+        exit(1);
+    }
+    if(listen(server_fd, 3) < 0){
+        perror("listen");
+        exit(1);
+    }
+    while(true){
+        new_socket = accept(server_fd, (struct sockaddr *)&address, (socklen_t *)&addrlen);
+        if(new_socket < 0){
+            perror("accept");
+            continue;
+        }
+        valread = read(new_socket, buffer, 1024);
+        if(valread < 0){
+            printf("ERROR reading from socket");
+            continue;
+        }
+        //std::cout<<"server receives buffer:"<<buffer<<std::endl;
+        std::vector<std::string> tokens = unpack(buffer);
+        //std::cout<<"server receives tokens:"<<tokens<<std::endl;
+        char* msg;
+        if(do_cmd(tokens)){
+            msg = "operation succeeded.";
+        }else{
+            msg = "operation failed.";
+        }
+        send(new_socket, msg, strlen(msg), 0);
+    }
+    close(server_fd);
+}
+
 int main(int argc, char** argv) {
     if (argc < 3) usage(argc, argv);
 
@@ -225,7 +410,11 @@ int main(int argc, char** argv) {
     std::cout << "    Server ID:    " << stuff.server_id_ << std::endl;
     std::cout << "    Endpoint:     " << stuff.endpoint_ << std::endl;
     init_raft( cs_new<calc_state_machine>() );
-    loop();
+    std::thread listen_socket(server_listening);
+    std::thread listen_cmd(loop);
+
+    listen_cmd.join();
+    listen_socket.join();
 
     return 0;
 }
