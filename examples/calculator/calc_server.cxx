@@ -18,6 +18,7 @@ limitations under the License.
 #include "calc_state_machine.hxx"
 #include "in_memory_state_mgr.hxx"
 #include "logger_wrapper.hxx"
+#include "crypto.cpp"
 
 #include "nuraft.hxx"
 
@@ -36,6 +37,9 @@ limitations under the License.
 #include <thread>
 #include <vector>
 #include <strstream>
+#include <unordered_map>
+#include <assert.h>
+
 #define PORT 8080
 
 using namespace nuraft;
@@ -46,10 +50,23 @@ static const raft_params::return_method_type CALL_TYPE
     = raft_params::blocking;
 //  = raft_params::async_handler;
 
+std::string own_private_key_file;
+std::string own_public_key_file;
+
 #include "example_common.hxx"
 
 calc_state_machine* get_sm() {
     return static_cast<calc_state_machine*>( stuff.sm_.get() );
+}
+
+std::string generate_key_filename(int player_number, bool is_public) {
+    std::string s = "player" + std::to_string(player_number);
+    if (is_public) {
+        s += "public.pem";
+    } else {
+        s += "private.pem";
+    }
+    return s;
 }
 
 void handle_result(ptr<TestSuite::Timer> timer,
@@ -218,18 +235,23 @@ std::string pack(std::vector<std::string> tokens){
     std::string res = "";
     for(std::string v: tokens){
         res += v;
-        res += "-";
+        res += "|";
     }
+    res += std::to_string(stuff.raft_instance_->get_committed_log_idx());
+    res += "|";
+    res += signMessage(own_private_key_file, res);
+    std::cout << "created full packet: " << res << std::endl;
+    std::cout << "from " << own_private_key_file << std::endl;
     return res;
 }
 
 std::vector<std::string> unpack(char msg[]){
     std::vector<std::string> tokens;
-    char *token = strtok(msg, "-");
+    char *token = strtok(msg, "|");
     while(token != NULL){
         //std::cout<<"token: "<<token<<std::endl;
         tokens.push_back(token);
-        token = strtok(NULL, "-");
+        token = strtok(NULL, "|");
     }
     return tokens;
 }
@@ -279,6 +301,7 @@ int sock_connect(std::string srv_ip, std::string srv_port){
 }
 
 bool do_cmd(const std::vector<std::string>& tokens) {
+    std::cout << "do_cmd called" <<std::endl;
     if (!tokens.size()) return true;
 
     const std::string& cmd = tokens[0];
@@ -295,7 +318,28 @@ bool do_cmd(const std::vector<std::string>& tokens) {
             return false;
         }else if(srv_addr_str == "-1"){
             //std::cout<<"-1"<<std::endl;
-            append_log(cmd, tokens);
+            if (tokens.size() <= 3) { //non full packet with signature and log index. this means we are sending locally on the leader node (leader node player is sending command)
+                append_log(cmd, tokens);
+            }
+            else {
+                //this is remote command, need to verify authority
+                //tokens [1] should be player number. lets get it's public key
+                std::string remote_public = generate_key_filename(stoi(tokens[1]), true);
+                std::cout << "Starting message authority verification. Using public key file: " << remote_public << std::endl;
+                std::string msg = "";
+                for (int i = 0; i < 4; i++) { //construct the first part of the packet
+                    msg += tokens[i];
+                    msg += "|";
+                }
+                std::cout << "Message to verify: " << msg << std::endl;
+                std::cout << "Signature: " << (char*) tokens[4].c_str()<< std::endl;
+                // bool res = verifySignature(remote_public, msg, (char*) tokens[4].c_str());
+                // if (res) {
+                //     std::cout << "Verfication successful" << std::endl;
+                // } else {
+                //     std::cout << "verification unsuccessful" << std::endl;
+                // }
+            }
         }else{
             //std::cout<<">0"<<std::endl;
             int delim_pos = srv_addr_str.find(":");
@@ -381,6 +425,10 @@ void server_listening(){
             perror("accept");
             continue;
         }
+        // if (get_server_addr(stuff.server_id_) != "-1") {
+        //     std::cout << "connection refused because not leader" << std::endl;
+        //     continue;
+        // }
         valread = read(new_socket, buffer, 1024);
         if(valread < 0){
             printf("ERROR reading from socket");
@@ -405,11 +453,26 @@ int main(int argc, char** argv) {
 
     set_server_info(argc, argv);
 
-    std::cout << "    -- Replicated Calculator with Raft --" << std::endl;
+    //crypto stuff
+    std::unordered_map<int, std::string> player_number_key_mapping;
+    own_private_key_file = generate_key_filename(stuff.server_id_, false);
+    own_public_key_file = generate_key_filename(stuff.server_id_, true);
+    //RSA* own_private = createPrivateRSAFromFile((char *)own_private_key_file.c_str());
+    //RSA* own_public = createPublicRSAFromFile((char*)own_public_key_file.c_str());
+
+
+    //crypto testing
+    std::string test_msg = "example_packet_without_sign";
+    char* signature = signMessage(own_private_key_file, test_msg);
+    assert(verifySignature(own_public_key_file, test_msg, signature));
+
+    std::cout << "    -- Replicated Game State Machine with Raft --" << std::endl;
     std::cout << "                         Version 0.1.0" << std::endl;
     std::cout << "    Server ID:    " << stuff.server_id_ << std::endl;
     std::cout << "    Endpoint:     " << stuff.endpoint_ << std::endl;
+    std::cout << "    Private Key File:     " << own_private_key_file << std::endl;
     init_raft( cs_new<calc_state_machine>() );
+
     std::thread listen_socket(server_listening);
     std::thread listen_cmd(loop);
 
