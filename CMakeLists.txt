@@ -85,6 +85,8 @@ if (NOT WIN32)
     set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -std=c++11")
     set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -g")
     set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -fPIC")
+    set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -lsfml-graphics -lsfml-window -lsfml-system")
+
     if (APPLE)
         include_directories(BEFORE /usr/local/opt/openssl/include)
         link_directories(/usr/local/opt/openssl/lib)
@@ -97,6 +99,10 @@ else ()
     message(STATUS "---- WIN32 ----")
     set(DISABLE_SSL 1)
 endif ()
+
+find_package(SFML 2.5
+	COMPONENTS
+		graphics window system REQUIRED)
 
 # === Disable SSL ===
 if (DISABLE_SSL GREATER 0)
@@ -254,6 +260,9 @@ set_target_properties(static_lib PROPERTIES OUTPUT_NAME ${LIBRARY_NAME} CLEAN_DI
 
 add_library(shared_lib SHARED ${STATIC_LIB_SRC})
 set_target_properties(shared_lib PROPERTIES OUTPUT_NAME ${LIBRARY_NAME} CLEAN_DIRECT_OUTPUT 1)
+
+target_link_libraries(shared_lib sfml-graphics sfml-window sfml-system)
+
 if (APPLE)
     target_link_libraries(shared_lib ${LIBRARIES})
 endif ()
