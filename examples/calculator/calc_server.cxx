@@ -18,9 +18,10 @@ limitations under the License.
 #include "calc_state_machine.hxx"
 #include "in_memory_state_mgr.hxx"
 #include "logger_wrapper.hxx"
+#include "crypto.cpp"
 
 #include "nuraft.hxx"
-
+#include "Player.cpp"
 #include "test_common.h"
 
 #include <iostream>
@@ -36,6 +37,13 @@ limitations under the License.
 #include <thread>
 #include <vector>
 #include <strstream>
+#include <deque>
+#include <unordered_map>
+#include <assert.h>
+#include <SFML/System.hpp>
+#include <SFML/Window.hpp>
+#include <SFML/Graphics.hpp>
+
 #define PORT 8080
 
 using namespace nuraft;
@@ -46,10 +54,23 @@ static const raft_params::return_method_type CALL_TYPE
     = raft_params::blocking;
 //  = raft_params::async_handler;
 
+std::string own_private_key_file;
+std::string own_public_key_file;
+
 #include "example_common.hxx"
 
 calc_state_machine* get_sm() {
     return static_cast<calc_state_machine*>( stuff.sm_.get() );
+}
+
+std::string generate_key_filename(int player_number, bool is_public) {
+    std::string s = "player" + std::to_string(player_number);
+    if (is_public) {
+        s += "public.pem";
+    } else {
+        s += "private.pem";
+    }
+    return s;
 }
 
 void handle_result(ptr<TestSuite::Timer> timer,
@@ -218,18 +239,23 @@ std::string pack(std::vector<std::string> tokens){
     std::string res = "";
     for(std::string v: tokens){
         res += v;
-        res += "-";
+        res += "|";
     }
+    res += std::to_string(stuff.raft_instance_->get_committed_log_idx());
+    res += "|";
+    res += signMessage(own_private_key_file, res);
+    std::cout << "created full packet: " << res << std::endl;
+    std::cout << "from " << own_private_key_file << std::endl;
     return res;
 }
 
 std::vector<std::string> unpack(char msg[]){
     std::vector<std::string> tokens;
-    char *token = strtok(msg, "-");
+    char *token = strtok(msg, "|");
     while(token != NULL){
         //std::cout<<"token: "<<token<<std::endl;
         tokens.push_back(token);
-        token = strtok(NULL, "-");
+        token = strtok(NULL, "|");
     }
     return tokens;
 }
@@ -279,6 +305,7 @@ int sock_connect(std::string srv_ip, std::string srv_port){
 }
 
 bool do_cmd(const std::vector<std::string>& tokens) {
+    std::cout << "do_cmd called" <<std::endl;
     if (!tokens.size()) return true;
 
     const std::string& cmd = tokens[0];
@@ -295,7 +322,28 @@ bool do_cmd(const std::vector<std::string>& tokens) {
             return false;
         }else if(srv_addr_str == "-1"){
             //std::cout<<"-1"<<std::endl;
-            append_log(cmd, tokens);
+            if (tokens.size() <= 3) { //non full packet with signature and log index. this means we are sending locally on the leader node (leader node player is sending command)
+                append_log(cmd, tokens);
+            }
+            else {
+                //this is remote command, need to verify authority
+                //tokens [1] should be player number. lets get it's public key
+                std::string remote_public = generate_key_filename(stoi(tokens[1]), true);
+                std::cout << "Starting message authority verification. Using public key file: " << remote_public << std::endl;
+                std::string msg = "";
+                for (int i = 0; i < 4; i++) { //construct the first part of the packet
+                    msg += tokens[i];
+                    msg += "|";
+                }
+                std::cout << "Message to verify: " << msg << std::endl;
+                std::cout << "Signature: " << (char*) tokens[4].c_str()<< std::endl;
+                // bool res = verifySignature(remote_public, msg, (char*) tokens[4].c_str());
+                // if (res) {
+                //     std::cout << "Verfication successful" << std::endl;
+                // } else {
+                //     std::cout << "verification unsuccessful" << std::endl;
+                // }
+            }
         }else{
             //std::cout<<">0"<<std::endl;
             int delim_pos = srv_addr_str.find(":");
@@ -381,6 +429,10 @@ void server_listening(){
             perror("accept");
             continue;
         }
+        // if (get_server_addr(stuff.server_id_) != "-1") {
+        //     std::cout << "connection refused because not leader" << std::endl;
+        //     continue;
+        // }
         valread = read(new_socket, buffer, 1024);
         if(valread < 0){
             printf("ERROR reading from socket");
@@ -400,21 +452,215 @@ void server_listening(){
     close(server_fd);
 }
 
+void UI_run(){
+    // init game
+    float gridSizeF = 60.f;
+    unsigned gridSizeU = static_cast<unsigned>(gridSizeF);
+    int playerNum = 2;
+    std::vector<sf::Color> playerColor = {sf::Color::Red, sf::Color::Yellow};
+    std::vector<sf::Vector2f> origins = {sf::Vector2f(2*gridSizeF, 2*gridSizeF), sf::Vector2f(2*gridSizeF, 8*gridSizeF),
+        sf::Vector2f(8*gridSizeF, 2*gridSizeF), sf::Vector2f(8*gridSizeF, 8*gridSizeF)};
+    int64_t curPlayerValue;
+    int bombNum = 4;
+    int power = 1;
+    float dt = 0.f;
+    sf::Clock dtClock;
+    sf::Vector2i mousePosWindow;
+    sf::Vector2f mousePosView;
+    sf::Vector2u mousePosGrid;
+
+    // init the window
+    sf::RenderWindow window(sf::VideoMode(1920, 1080), "SFML works!");
+    window.setFramerateLimit(120);
+
+    sf::View view;
+    view.setSize(1680.f, 900.f);
+    view.setCenter(window.getSize().x / 2.f, window.getSize().y / 2.f);
+    float speed = 200.f;
+
+    window.setView(view);
+
+    // init game elements
+    std::vector<Player> players;
+    for(int i=0; i<playerNum; i++){
+        sf::RectangleShape player(sf::Vector2f(gridSizeF, gridSizeF));
+        player.setFillColor(playerColor[i]);
+        player.setOrigin(origins[i]);
+        Player* player_c = new Player(player);
+        players.push_back(*player_c);
+    }
+    
+
+    std::deque<Bomb> bombs;
+    std::deque<Waves> waves;
+
+    const int mapSize = 10;
+    std::vector<std::vector <sf::RectangleShape>> tileMap;
+    tileMap.resize(mapSize*2, std::vector<sf::RectangleShape>());
+    for(int x = 0; x < mapSize*2; x++){
+        tileMap[x].resize(mapSize, sf::RectangleShape());
+        for(int y = 0; y < mapSize; y++){
+            tileMap[x][y].setSize(sf::Vector2f(gridSizeF, gridSizeF));
+            tileMap[x][y].setFillColor(sf::Color::White);
+            tileMap[x][y].setOutlineColor(sf::Color::Black);
+            tileMap[x][y].setOutlineThickness(2.f);
+            tileMap[x][y].setPosition(x * gridSizeF, y * gridSizeF);
+        }
+    }
+
+    sf::RectangleShape tileSelector(sf::Vector2f(gridSizeF, gridSizeF));
+    tileSelector.setFillColor(sf::Color::Transparent);
+    tileSelector.setOutlineColor(sf::Color::Green);
+    tileSelector.setOutlineThickness(2.f);
+    
+
+    while(window.isOpen()){
+        //Update dt
+        dt = dtClock.restart().asSeconds();
+
+        //Update mouse positions
+        mousePosWindow = sf::Mouse::getPosition(window);
+        window.setView(view);
+        mousePosView = window.mapPixelToCoords(mousePosWindow);
+        if(mousePosView.x >= 0.f){
+            mousePosGrid.x = mousePosView.x / gridSizeU;
+        }
+        if(mousePosView.y >= 0.f){
+            mousePosGrid.y = mousePosView.y / gridSizeU;
+        }
+        window.setView(window.getDefaultView());
+
+        //Update game elements
+        for(int i=0; i<playerNum; i++){
+            int pos = get_sm()->get_player_pos(i+1);
+            players[i].setPos(pos, i+1);
+        }
+        curPlayerValue = get_sm()->get_current_value();
+
+        tileSelector.setPosition(mousePosGrid.x * gridSizeF, mousePosGrid.y * gridSizeF);
+        while(!bombs.empty()){
+            if(bombs.front().getTime() < 4){
+                break;
+            }
+            waves.push_back(bombs.front().getWaves());
+            bombs.pop_front();
+        }
+        
+        while(!waves.empty()){
+            if(waves.front().getTime() < 1){
+                break;
+            }
+            waves.pop_front();
+        }
+
+        //Update UI
+
+
+        //Events
+        sf::Event event;
+        while(window.pollEvent(event)){
+            if(event.type == sf::Event::Closed){
+                window.close();
+            }
+            if(event.type == sf::Event::KeyPressed){
+                if(event.key.code == sf::Keyboard::Space && bombs.size() < bombNum){
+                    sf::CircleShape bomb(gridSizeF / 2);
+                    bomb.setFillColor(sf::Color::Cyan);
+                    bomb.setPosition(players[curPlayerValue-1].getPlayer().getPosition());
+                    Bomb* bomb_g = new Bomb(bomb, power);
+                    bombs.push_back(*bomb_g);
+                }
+            }
+        }
+
+        // Update
+        // Update input
+        sf::Vector2u myPosGrid = players[curPlayerValue-1].getPosGrid();
+        if(sf::Keyboard::isKeyPressed(sf::Keyboard::Left)){
+            if(myPosGrid.x > 0){
+                myPosGrid.x -= 1;
+            }
+        }else if(sf::Keyboard::isKeyPressed(sf::Keyboard::Right)){
+            if(myPosGrid.x < 10){
+                myPosGrid.x += 1;
+            }
+        }else if(sf::Keyboard::isKeyPressed(sf::Keyboard::Up)){
+            if(myPosGrid.y > 0){
+                myPosGrid.y -= 1;
+            }
+        }else if(sf::Keyboard::isKeyPressed(sf::Keyboard::Down)){
+            if(myPosGrid.y < 10){
+                myPosGrid.y += 1;
+            }
+        }
+        players[curPlayerValue-1].setPos(myPosGrid.x, myPosGrid.y);
+            // players[curPlayerValue-1].getPlayer().move(speed * dt, 0.f);
+
+        //Render
+        window.clear();
+
+        //Render game elements
+        window.setView(view);
+
+        for(int x = 0; x < mapSize*2; x++){
+            for(int y = 0; y < mapSize; y++){
+                window.draw(tileMap[x][y]);
+            }
+        }
+
+        for(auto& bomb: bombs){
+            window.draw(bomb.getBomb());
+        }
+        for(auto& wave: waves){
+            for(auto& wave_tile: wave.getWaves()){
+                window.draw(wave_tile);
+            }
+        }
+
+        for(auto& player: players){
+            window.draw(player.getPlayer());
+        }
+        
+        window.draw(tileSelector);
+
+        //Render UI
+        window.setView(window.getDefaultView());
+
+        //Done drawing
+        window.display();
+    }
+}
+
 int main(int argc, char** argv) {
     if (argc < 3) usage(argc, argv);
 
     set_server_info(argc, argv);
 
-    std::cout << "    -- Replicated Calculator with Raft --" << std::endl;
+    //crypto stuff
+    std::unordered_map<int, std::string> player_number_key_mapping;
+    own_private_key_file = generate_key_filename(stuff.server_id_, false);
+    own_public_key_file = generate_key_filename(stuff.server_id_, true);
+    //RSA* own_private = createPrivateRSAFromFile((char *)own_private_key_file.c_str());
+    //RSA* own_public = createPublicRSAFromFile((char*)own_public_key_file.c_str());
+
+
+    //crypto testing
+    std::string test_msg = "example_packet_without_sign";
+    char* signature = signMessage(own_private_key_file, test_msg);
+    assert(verifySignature(own_public_key_file, test_msg, signature));
+
+    std::cout << "    -- Replicated Game State Machine with Raft --" << std::endl;
     std::cout << "                         Version 0.1.0" << std::endl;
     std::cout << "    Server ID:    " << stuff.server_id_ << std::endl;
     std::cout << "    Endpoint:     " << stuff.endpoint_ << std::endl;
+    std::cout << "    Private Key File:     " << own_private_key_file << std::endl;
     init_raft( cs_new<calc_state_machine>() );
-    std::thread listen_socket(server_listening);
-    std::thread listen_cmd(loop);
 
-    listen_cmd.join();
-    listen_socket.join();
+    // std::thread listen_socket(server_listening);
+    // std::thread listen_cmd(loop);
+    UI_run();
+    // listen_cmd.join();
+    // listen_socket.join();
 
     return 0;
 }
